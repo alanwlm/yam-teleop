@@ -1,4 +1,4 @@
-# GELLO leader arm configuration
+# GELLO leader arm configuration (launch_nodes.sh --leader gello)
 baudrate: 1000000
 
 left:
@@ -30,3 +30,8 @@ right:
 publish_rate_hz: 200
 zmq_port: 5004
 zmq_cmd_port: 5006    # commands: position targets + torque control (PULL)
+
+# Safety watchdog (only armed once a controller heartbeats — collect_yam /
+# teleop_min do, collect_data doesn't): if it goes silent this long while
+# torque is on, the GELLO arms go limp.
+watchdog_timeout: 1.0

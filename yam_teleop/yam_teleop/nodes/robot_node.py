@@ -16,10 +16,23 @@ from tqdm import tqdm
 import yaml
 import zmq
 
-from gello.robots.yam import YAMRobot
+from yam_teleop.hardware.yam_follower import YamFollower
+
+# Geometry of the linear_4310 gripper, used only to draw the grip-force "hold"
+# band on the torque plot and to print the cap in Newtons. Once a grasp is
+# detected the grasp controller (hardware/gripper_grasp.py) holds
+#   tau = gripper_max_force * gripper_stroke / motor_stroke  (+ friction comp)
+# (i2rt's linear_gripper_force_torque_map: motor_stroke=6.57 rad,
+# gripper_stroke=0.096 m; friction comp ~0.3 Nm).
+_GRIPPER_MOTOR_STROKE_RAD = 6.57
+_GRIPPER_STROKE_M = 0.096
+_GRIPPER_FRICTION_COMP_NM = 0.3
+# After a gap in the command stream, cap the slew dt so a single tick can't jump
+# far (velocity = delta/dt stays bounded even if dt is large).
+_SLEW_DT_CAP_S = 0.05
 
 
-def safe_return_to_home(left_arm: YAMRobot, right_arm: YAMRobot,
+def safe_return_to_home(left_arm: YamFollower, right_arm: YamFollower,
                         home: np.ndarray, max_delta: float) -> None:
     """Gradually move both arms to home position before shutdown."""
     print("Safe shutdown: returning arms to home position...")
@@ -57,13 +70,22 @@ def safe_return_to_home(left_arm: YAMRobot, right_arm: YAMRobot,
         print("  Shutdown interrupted — stopping where we are.")
 
 
-def make_yam_arm(arm_cfg: dict, gripper_max_force: float) -> YAMRobot:
-    """Create a YAMRobot from config."""
-    return YAMRobot(
+def make_yam_arm(cfg: dict, side: str) -> YamFollower:
+    """Create a follower YAM arm from config (per-arm keys override top-level)."""
+    arm_cfg = cfg[side]
+    return YamFollower(
         channel=arm_cfg["can_channel"],
         gripper_type=arm_cfg["gripper_type"],
         zero_gravity_mode=arm_cfg["zero_gravity_mode"],
-        limit_gripper_force=gripper_max_force,
+        limit_gripper_force=cfg.get("gripper_max_force", 50.0),
+        gripper_torque_cap=cfg.get("gripper_torque_cap", 0.0),
+        gripper_max_speed=cfg.get("gripper_max_speed", 0.0),
+        gripper_max_open=cfg.get("gripper_max_open", 0.85),
+        gravity_comp_factor=arm_cfg.get(
+            "gravity_comp_factor", cfg.get("gravity_comp_factor")),
+        kp=arm_cfg.get("kp", cfg.get("kp")),
+        kd=arm_cfg.get("kd", cfg.get("kd")),
+        sim=bool(cfg.get("sim", False)),
     )
 
 
@@ -71,6 +93,11 @@ def main():
     parser = argparse.ArgumentParser(description="Robot arm node")
     parser.add_argument("--config", required=True, help="Path to robot.yaml")
     parser.add_argument("--debug", action="store_true", help="Print joint states")
+    parser.add_argument("--plot-gripper", action="store_true",
+                        help="Open a live window graphing follower gripper "
+                             "position, velocity and torque")
+    parser.add_argument("--plot-window-sec", type=float, default=20.0,
+                        help="Seconds of history shown in the gripper plot")
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -81,12 +108,20 @@ def main():
     cmd_port = cfg["zmq_cmd_port"]
     gripper_max_open = cfg.get("gripper_max_open", 0.85)
     gripper_max_force = cfg.get("gripper_max_force", 50.0)
+    # Max gripper closing/opening speed in stroke-fraction/s (0 disables). Caps
+    # how fast the commanded gripper position may change, so a fast human squeeze
+    # can't slam the gripper shut and spike the torque before the force limiter
+    # engages. Tune with the --plot-gripper torque panel.
+    gripper_max_speed = cfg.get("gripper_max_speed", 0.0)
+    # Ceiling (Nm) on gripper squeeze torque (0 disables); see robot.yaml.
+    gripper_torque_cap = cfg.get("gripper_torque_cap", 0.0)
 
     # Initialize both YAM arms
-    print("Initializing left YAM arm...")
-    left_arm = make_yam_arm(cfg["left"], gripper_max_force)
-    print("Initializing right YAM arm...")
-    right_arm = make_yam_arm(cfg["right"], gripper_max_force)
+    sim_note = " (MuJoCo sim)" if cfg.get("sim", False) else ""
+    print(f"Initializing left YAM arm{sim_note}...")
+    left_arm = make_yam_arm(cfg, "left")
+    print(f"Initializing right YAM arm{sim_note}...")
+    right_arm = make_yam_arm(cfg, "right")
 
     # ZMQ sockets
     ctx = zmq.Context()
@@ -118,7 +153,37 @@ def main():
     cmd_count = [0]
     cmd_errors = [0]
 
+    # Gripper slew-rate limiter state. Seed from the actual startup gripper
+    # positions so the first command slews from reality, not from a guess.
+    grip_state = {
+        "left": float(left_arm.get_observations()["gripper_position"][0]),
+        "right": float(right_arm.get_observations()["gripper_position"][0]),
+        "t": None,
+    }
+    if gripper_max_speed > 0:
+        print(f"Gripper slew limit: {gripper_max_speed:.2f} stroke-fraction/s")
+    if gripper_torque_cap > 0:
+        cap_n = gripper_torque_cap * _GRIPPER_MOTOR_STROKE_RAD / _GRIPPER_STROKE_M
+        print(f"Gripper torque cap: {gripper_torque_cap:.2f} Nm (~{cap_n:.0f} N gross); "
+              f"grip force when holding: {gripper_max_force:.0f} N")
+
+    # Arms whose grasp controller already ramps the gripper at
+    # gripper_max_speed inside i2rt's 1 kHz loop. Slewing here as well would
+    # wind up past a held object and delay every release.
+    in_loop_ramp = {"left": left_arm.grasp is not None,
+                    "right": right_arm.grasp is not None}
+
     def cmd_receiver():
+        def slew_gripper(arm: str, raw_pos: float, dt: float) -> float:
+            """Clamp the commanded gripper pos to <= gripper_max_speed rate."""
+            target = min(raw_pos, gripper_max_open)
+            prev = grip_state[arm]
+            if gripper_max_speed > 0 and dt > 0 and not in_loop_ramp[arm]:
+                step = gripper_max_speed * dt
+                target = float(np.clip(target, prev - step, prev + step))
+            grip_state[arm] = target
+            return target
+
         while running:
             try:
                 msg = cmd_sub.recv_json(flags=zmq.NOBLOCK)
@@ -129,12 +194,20 @@ def main():
                 left_cmd = msg["left"]
                 right_cmd = msg["right"]
 
+                now = time.monotonic()
+                # First command uses the dt cap so it's still rate-limited.
+                dt = (_SLEW_DT_CAP_S if grip_state["t"] is None
+                      else min(now - grip_state["t"], _SLEW_DT_CAP_S))
+                grip_state["t"] = now
+
                 left_target = np.array(
-                    left_cmd["joint_pos"] + [min(left_cmd["gripper_pos"], gripper_max_open)],
+                    left_cmd["joint_pos"]
+                    + [slew_gripper("left", left_cmd["gripper_pos"], dt)],
                     dtype=np.float32,
                 )
                 right_target = np.array(
-                    right_cmd["joint_pos"] + [min(right_cmd["gripper_pos"], gripper_max_open)],
+                    right_cmd["joint_pos"]
+                    + [slew_gripper("right", right_cmd["gripper_pos"], dt)],
                     dtype=np.float32,
                 )
 
@@ -152,9 +225,36 @@ def main():
 
     print(f"Robot node: state on :{state_port} at {publish_rate}Hz, "
           f"commands on :{cmd_port}")
+
+    # Optional live gripper plot. Runs in its own process (see gripper_plot)
+    # so it can't stall this loop; we only feed it a downsampled ~50Hz stream.
+    plotter = None
+    plot_decim = 1
+    if args.plot_gripper:
+        from yam_teleop.nodes.gripper_plot import GripperPlotter
+        # Force-limit "hold" torque band (only meaningful for linear grippers).
+        hold_band = None
+        if "linear" in str(cfg["left"].get("gripper_type", "")).lower():
+            tau_lo = gripper_max_force * _GRIPPER_STROKE_M / _GRIPPER_MOTOR_STROKE_RAD
+            tau_hi = tau_lo + _GRIPPER_FRICTION_COMP_NM
+            if gripper_torque_cap > 0:
+                tau_lo, tau_hi = min(tau_lo, gripper_torque_cap), min(tau_hi, gripper_torque_cap)
+            hold_band = (tau_lo, tau_hi)
+        plotter = GripperPlotter(
+            window_sec=args.plot_window_sec,
+            speed_limit=(gripper_max_speed if gripper_max_speed > 0 else None),
+            hold_band=hold_band,
+        )
+        plot_decim = max(1, round(publish_rate / 50.0))
+        print("Live gripper plot: position | velocity | torque (separate window)")
+
     rate = RateLimiter(frequency=publish_rate, warn=False)
     pbar = tqdm(desc="Robot node", unit="msg", smoothing=0.05, mininterval=1.0)
     t_debug = time.time()
+    loop_i = 0
+    # Log grasp-controller transitions (it runs in i2rt's thread; poll here).
+    arms = {"L": left_arm, "R": right_arm}
+    was_grasping = {k: False for k in arms}
 
     try:
         while running:
@@ -183,6 +283,32 @@ def main():
             }
             state_pub.send_json(msg)
 
+            for side, arm in arms.items():
+                g = arm.gripper_grasping
+                if g != was_grasping[side]:
+                    was_grasping[side] = g
+                    if g:
+                        tqdm.write(f"[gripper {side}] GRASP: contact — holding at "
+                                   f"{arm.grasp.hold_nm:.2f} Nm "
+                                   f"(gripper_max_force), no harder")
+                    else:
+                        tqdm.write(f"[gripper {side}] released")
+
+            # Feed the live gripper plot: position, finite-diff velocity, and
+            # measured torque. Gripper is the 7th joint (index 6), so its
+            # velocity is joint_velocities[6] and torque is gripper_eff.
+            loop_i += 1
+            if plotter is not None and loop_i % plot_decim == 0:
+                plotter.push(
+                    time.monotonic(),
+                    msg["left"]["gripper_pos"],
+                    float(left_obs["joint_velocities"][6]),
+                    msg["left"]["gripper_eff"],
+                    msg["right"]["gripper_pos"],
+                    float(right_obs["joint_velocities"][6]),
+                    msg["right"]["gripper_eff"],
+                )
+
             pbar.update(1)
             pbar.set_postfix_str(
                 f"cmds_applied={cmd_count[0]} errors={cmd_errors[0]}")
@@ -201,14 +327,22 @@ def main():
         print(f"FATAL: {e}", file=sys.stderr)
     finally:
         pbar.close()
+        if plotter is not None:
+            plotter.close()
         state_pub.close()
         cmd_sub.close()
         ctx.term()
 
-        # Safe shutdown: gradually move arms to home position
+        # Safe shutdown: gradually move arms to home position. Guarded so the
+        # motors always power down even if the move fails (e.g. one arm's
+        # control loop died) — never leave the arms energized-but-stuck.
         home = np.array(cfg["home_position"], dtype=np.float32)
         max_delta = cfg.get("shutdown_max_delta", 0.01)
-        safe_return_to_home(left_arm, right_arm, home, max_delta)
+        try:
+            safe_return_to_home(left_arm, right_arm, home, max_delta)
+        except Exception as e:
+            print(f"  Safe return failed ({type(e).__name__}: {e}); "
+                  f"powering motors off anyway.", file=sys.stderr)
 
         left_arm.close()
         right_arm.close()

@@ -1,11 +1,25 @@
 """GELLO leader arm node: command-driven server.
 
+Alternative to yam_leader_node for rigs with GELLO (Dynamixel) leader arms;
+same ports and state message shape, so everything downstream is shared.
+
 Publishes joint positions at 200Hz via ZMQ PUB.
 Accepts position commands and torque control via ZMQ PULL.
 
 Port layout:
   - zmq_port (5004): state PUB (always publishing at 200Hz)
   - zmq_cmd_port (5006): commands PULL (position targets + torque control)
+
+Commands (the shared leader protocol; GELLO is unilateral, so it has no
+bilateral feedback, clutch, or buttons):
+  - enable_torque            -> position control; follows streamed targets
+  - disable_torque / free    -> limp
+  - couple                   -> limp (start teleop: the operator moves it)
+  - heartbeat                -> liveness only. Once a controller heartbeats
+                                (collect_yam / teleop_min), the node drops to
+                                limp if it goes silent for watchdog_timeout
+                                while torque is on. collect_data doesn't
+                                heartbeat, so the watchdog stays disarmed.
 
 Usage:
     python -m yam_teleop.nodes.gello_node --config configs/gello.yaml
@@ -22,12 +36,12 @@ from tqdm import tqdm
 import yaml
 import zmq
 
-from gello.dynamixel.driver import (
+from yam_teleop.hardware.gello.driver import (
     ADDR_TORQUE_ENABLE,
     EXTENDED_POSITION_CONTROL_MODE,
     TORQUE_DISABLE,
 )
-from gello.robots.dynamixel import DynamixelRobot
+from yam_teleop.hardware.gello.dynamixel import DynamixelRobot
 
 
 def make_gello_arm(arm_cfg: dict, baudrate: int) -> DynamixelRobot:
@@ -162,6 +176,7 @@ def main():
     publish_rate = cfg["publish_rate_hz"]
     port = cfg["zmq_port"]
     cmd_port = cfg.get("zmq_cmd_port", 5006)
+    watchdog_timeout = float(cfg.get("watchdog_timeout", 1.0))
 
     # Initialize both GELLO arms
     print("Initializing left GELLO arm...")
@@ -204,6 +219,17 @@ def main():
     torque_enabled = False
     current_target_left = None
     current_target_right = None
+    last_cmd_t = None  # set once a controller heartbeats (arms the watchdog)
+
+    def go_limp(reason: str) -> None:
+        nonlocal torque_enabled, current_target_left, current_target_right
+        if torque_enabled:
+            _disable_arm_torque(left_arm)
+            _disable_arm_torque(right_arm)
+        torque_enabled = False
+        current_target_left = None
+        current_target_right = None
+        tqdm.write(f"Torque DISABLED ({reason})")
 
     try:
         while running:
@@ -211,6 +237,8 @@ def main():
             while True:
                 try:
                     cmd = cmd_pull.recv_json(flags=zmq.NOBLOCK)
+                    if last_cmd_t is not None or cmd.get("command") == "heartbeat":
+                        last_cmd_t = time.monotonic()
                     if "command" in cmd:
                         # Control command: enable_torque / disable_torque
                         if cmd["command"] == "enable_torque":
@@ -224,13 +252,8 @@ def main():
                             torque_enabled = True
                             tqdm.write(f"Torque ENABLED "
                                        f"(gripper_limp={gripper_limp})")
-                        elif cmd["command"] == "disable_torque":
-                            _disable_arm_torque(left_arm)
-                            _disable_arm_torque(right_arm)
-                            torque_enabled = False
-                            current_target_left = None
-                            current_target_right = None
-                            tqdm.write("Torque DISABLED")
+                        elif cmd["command"] in ("disable_torque", "free", "couple"):
+                            go_limp(cmd["command"])
                     elif "left" in cmd:
                         # Position command (same format as YAM robot_node)
                         current_target_left = np.array(
@@ -239,6 +262,13 @@ def main():
                             cmd["right"]["joint_pos"])
                 except zmq.Again:
                     break
+
+            # Watchdog: a heartbeating controller went silent -> limp.
+            if (last_cmd_t is not None and torque_enabled
+                    and time.monotonic() - last_cmd_t > watchdog_timeout):
+                go_limp(f"WATCHDOG: no controller heartbeat for "
+                        f">{watchdog_timeout:.1f}s")
+                last_cmd_t = None  # disarm until a controller reconnects
 
             # 2. Apply position if torque enabled
             if torque_enabled and current_target_left is not None:
